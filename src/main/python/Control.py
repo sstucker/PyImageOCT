@@ -9,36 +9,30 @@ import nidaqmx
 from PyIMAQ import PyIMAQ
 from nidaqmx.stream_writers import AnalogMultiChannelWriter
 from nidaqmx.constants import LineGrouping, Edge, AcquisitionType, Signal
-from PyScanPattern.Patterns import Figure8ScanPattern, RasterScanPattern
+from PyScanPattern.Patterns import Figure8ScanPattern, RasterScanPattern, LineScanPattern
 import numpy as np
 from queue import Empty, Full
 import multiprocessing as mp
 from dataclasses import dataclass
 import threading
+from NpyWriterProcess import *
+from SharedCircularBuffer import *
 
 # HardwareControlProcess messages
-VOID = 0
-INSTR_OPEN = 1
-INSTR_CLOSE = 2
-INSTR_STOP_ACQ = 3
-INSTR_START_ACQ = 4
-INSTR_UPDATE_ACQ = 5
+VOID = 0  # Do nothing
+INSTR_OPEN = 1  # Open the hardware interface with the parameters in the msg
+INSTR_CLOSE = 2  # Close the hardware interface
+INSTR_STOP_ACQ = 3  # Stop the scan if scanning
+INSTR_START_ACQ = 4  # Start the scan if ready
+INSTR_UPDATE_ACQ = 5  # Update the interface with the parameters in the msg, but not those that require a reopen
+INSTR_BEGIN_SAVE = 6  # Start saving to disk
+INSTR_END_SAVE = 7  # Stop saving to disk
 
 # HardwareControlProcess states
-READY = 0
-NOT_READY = -2
-ACQUIRING = 1
-EXITING = -1
-
-
-class RepeatTimer(threading.Timer):
-    """
-    Thank you Hans Then & right2clicky on stackoverflow!
-    """
-
-    def run(self):
-        while not self.finished.wait(self.interval):
-            self.function(*self.args, **self.kwargs)
+STATUS_READY = 0  # Interface opened successfully; ready to begin a scan
+STATUS_NOT_READY = -2  # No interface exists or interface failed to open
+STATUS_ACQUIRING = 1  # The interface is currently busy with a scan
+STATUS_EXITING = -1  # The process's lifetime has ended
 
 
 # -- Data structures ---------------------------------------------------------------------------------------------------
@@ -49,23 +43,14 @@ class SlotStruct:
         return self.__slots__
 
 
-class Message(SlotStruct):
+class Message:
     """
     Information enqueued by parent process of a HardwareControlProcess via the process's msg_queue
     """
     pass
 
 
-@dataclass
-class Frame:
-    """
-    Atomic unit of data allocated by HardwareControlProcess and enqueued
-    """
-    pass
-
-
 # -- Messages ----------------------------------------------------------------------------------------------------------
-
 
 class NIConfig(SlotStruct):
     """
@@ -85,6 +70,18 @@ class NIConfig(SlotStruct):
         self.dac_rate = None
 
 
+class WriterConfig(SlotStruct):
+    """
+    Fast access structure for line scan signals to galvos x, y and line and frame triggers
+    """
+    __slots__ = ["fpath", "max_bytes", "type"]
+
+    def __init__(self):
+        self.fpath = None
+        self.max_bytes = 0
+        self.type = None
+
+
 class ScanSignals(SlotStruct):
     """
     Fast access structure for line scan signals to galvos x, y and line and frame triggers
@@ -98,26 +95,29 @@ class ScanSignals(SlotStruct):
         self.y_sig = None
 
 
-class MotionOCTFrame(Frame):
-    __slots__ = ["b", "mot", "spec"]
+class OCTConfig(SlotStruct):
+    __slots__ = ["aline_size", "alines_per_buffer", "alines_per_bline", "number_of_blines", "apod_window",
+                 "lambda_data", "ztop", "zbottom"]
 
-
-class MotionOCTMessage(Message):
-    __slots__ = ["instruction", "niconfig", "scansig", "aline_size", "alines_per_buffer", "number_of_blines",
-                 "apod_window", "lambda_data", "phase_corr_apod_filter_2d", "zstart", "npeak", "nrepeat", "time_lags"]
-
-    def __init__(self, instr):
-        # Sub structures
-        self.instruction = instr
-        self.niconfig = NIConfig()
-        self.scansig = ScanSignals()
-
-        # OCT Processing parameters
+    def __init__(self):
         self.aline_size = None
         self.alines_per_buffer = None
+        self.alines_per_bline = None
         self.number_of_blines = None
         self.apod_window = None
         self.lambda_data = None
+        self.ztop = None
+        self.zbottom = None
+
+
+class MotionOCTMessage(Message):
+
+    def __init__(self, instr):
+        self.instruction = instr
+        self.niconfig = NIConfig()
+        self.scansig = ScanSignals()
+        self.writer = WriterConfig()
+        self.oct = OCTConfig()
 
         # Motion processing parameters
         self.phase_corr_apod_filter_2d = None
@@ -127,8 +127,34 @@ class MotionOCTMessage(Message):
         self.time_lags = None
 
 
-# -- Process managers --------------------------------------------------------------------------------------------------
+class OCTAMessage(Message):
 
+    def __init__(self, instr):
+        self.instruction = instr
+        self.niconfig = NIConfig()
+        self.scansig = ScanSignals()
+        self.oct = OCTConfig()
+        self.writer = WriterConfig()
+
+
+# -- Frames ------------------------------------------------------------------------------------------------------------
+
+class Frame:
+    """
+    Atomic unit of data allocated by HardwareControlProcess and enqueued
+    """
+    pass
+
+
+class MotionOCTFrame(Frame):
+    __slots__ = ["b", "mot", "spec"]
+
+
+class OCTAFrame(Frame):
+    __slots__ = ["rr", "raw", "spec"]
+
+
+# -- Process managers --------------------------------------------------------------------------------------------------
 
 class HardwareControlProcess(mp.Process):
     """
@@ -136,7 +162,7 @@ class HardwareControlProcess(mp.Process):
     behaves accordingly via virtual methods recv_msg and acquire_frame
     """
 
-    def __init__(self, exit_event, frame_buffer_max=1024, poll_time_sec=float(1 / 60)):
+    def __init__(self, exit_event, frame_buffer_max=32, poll_time_sec=float(1 / 60)):
         """
         :param stop_event: The manager of the process should set this event to stop the dispose of it safely
         :param frame_buffer_max: The capacity of data buffer. A "frame" is the atomic unit of information that can be
@@ -146,29 +172,36 @@ class HardwareControlProcess(mp.Process):
         super(HardwareControlProcess, self).__init__()
 
         # Public
-        self.msg_queue = mp.Queue()
-        self.frame_queue = mp.Queue(maxsize=frame_buffer_max)
-        self.status = mp.Value('i', READY)
+        self.msg_queue = mp.Queue()  # Queue for incoming msgs
+        self.frame_queue = mp.Queue(maxsize=frame_buffer_max)  # Receptacle for acquired frames, for proc or display
+        self.status = mp.Value('i', STATUS_NOT_READY)  # Process status
+        self.saving = mp.Value('i', 0)  # If true, frames are enqueued with writer process
         self.dropped_frames = mp.Value('i', 0)
 
         # Protected
-        self._poll_timer = None
         self._exit_event = exit_event
         self._poll_time_sec = poll_time_sec
-        self._total_grabbed = 0
+        self._frame_buffer_max = frame_buffer_max
 
-    def _poll_msg_buffer(self):
-        print(type(self).__name__ + ': polling msg buffer...')
+        self._total_grabbed = 0  # Total frames grabbed since opening
+
+    def _poll_msg_buffer(self, timeout=None):
         try:
-            self.recv_msg(self.msg_queue.get(timeout=False))
+            self.recv_msg(self.msg_queue.get(timeout=timeout))
         except Empty:
-            print(type(self).__name__ + ': no messages...')
+            pass
 
     def send_msg(self, msg):
         self.msg_queue.put(msg, timeout=False)
 
     def get_frame_buffer(self):
         return self.frame_queue
+
+    def grab_frame(self):
+        try:
+            return self.frame_queue.get(timeout=None)
+        except Empty:
+            return None
 
     def run(self):
         """
@@ -177,27 +210,25 @@ class HardwareControlProcess(mp.Process):
         set.
         """
         print(type(self).__name__ + ': running... PID', os.getpid())
-        self._poll_timer = RepeatTimer(self._poll_time_sec, self._poll_msg_buffer)
-        self._poll_timer.start()
+        self._total_grabbed = 0
         self.setup()
-        self.status.value = READY
-        while not self._exit_event.is_set():
+        while not self._exit_event.is_set() and os.getppid() is not 1:
             # -- begin optimized ------------------------------------------------------------------------------------
-            # print(type(self).__name__+': status', str(self.status.value))
-            if self.status.value is ACQUIRING:
+            if self.status.value is STATUS_ACQUIRING:
+                self._poll_msg_buffer(timeout=False)
                 f = self.acquire_frame()
                 if f is not None:
                     try:
                         self.frame_queue.put(f, timeout=False)
                         self._total_grabbed += 1
-                        print(type(self).__name__ + ': enqueued a frame...')
                     except Full:
                         print(type(self).__name__ + ': dropped a frame! Buffer was full...')
                         with self.dropped_frames.get_lock():
                             self.dropped_frames.value += 1
+            else:
+                self._poll_msg_buffer(timeout=1)  # Block and wait for messages if not scanning
             # -- end optimized --------------------------------------------------------------------------------------
-        self._poll_timer.cancel()
-        self.status.value = EXITING
+        self.status.value = STATUS_EXITING
         self.close()
 
     def setup(self):
@@ -220,132 +251,179 @@ class HardwareControlProcess(mp.Process):
 
     def acquire_frame(self):
         """
-        :return: a Frame object
+        :return: a Frame object or None
         """
         raise NotImplementedError
 
 
-class MotionOCTControlProcess(HardwareControlProcess):
-    def __init__(self, exit_event, frame_buffer_max=1024, poll_time_sec=float(1 / 2)):
+class NIOCTControlProcess(HardwareControlProcess):
 
-        super(MotionOCTControlProcess, self).__init__(exit_event, frame_buffer_max, poll_time_sec)
+    def __init__(self, exit_event, frame_buffer_max, poll_time_sec):
+        super(NIOCTControlProcess, self).__init__(exit_event, frame_buffer_max, poll_time_sec)
 
-        # Properties
-        self._time_started = None
+        self.name = "OCT Control Process"
+
+        self.niconfig = NIConfig()
+        self.scansig = ScanSignals()
+        self.oct = OCTConfig()
 
         # DAQmx interface handles
         self._scan_task = None
         self._scan_writer = None
         self._scan_timing = None
 
-        # Params
-        self.niconfig = None
-        self.scansig = None
-        self.aline_size = None
-        self.alines_per_buffer = None
-        self.number_of_blines = None
-        self.apod_window = None
-        self.lambda_data = None
-        self.phase_corr_apod_filter_2d = None
-        self.zstart = None
-        self.npeak = None
-        self.nrepeat = None
-        self.time_lags = None
+    def _init_hardware_interface(self):
+        # Initialize DAQmx interface
 
-        # Derived params
-        self.bwidth = None
-        self.halfwidth = None
-        self.time_lags_n = None
+        self._scan_task = nidaqmx.Task()
+        self._scan_timing = nidaqmx.task.Timing(self._scan_task)
+        dac_name = self.niconfig.dac_device
+        dac_ao_channel_ids = [
+            dac_name + '/' + self.niconfig.line_trig_ch,
+            dac_name + '/' + self.niconfig.frame_trig_ch,
+            dac_name + '/' + self.niconfig.x_ch,
+            dac_name + '/' + self.niconfig.y_ch
+        ]
+        for ch_name in dac_ao_channel_ids:
+            self._scan_task.ao_channels.add_ao_voltage_chan(ch_name)
 
-    def close(self):
+        self._scan_task.timing.cfg_samp_clk_timing(self.niconfig.dac_rate,  # TODO move?
+                                                   source="",
+                                                   active_edge=Edge.RISING,
+                                                   sample_mode=AcquisitionType.CONTINUOUS)
+        self._scan_task.regen_mode = nidaqmx.constants.RegenerationMode.DONT_ALLOW_REGENERATION  # TODO test
+        self._scan_writer = AnalogMultiChannelWriter(self._scan_task.out_stream)
+
+        print("NIOCTController: initialized DAQmx interface...")
+        # Initialize IMAQ interface
+        PyIMAQ.imgOpen(self.niconfig.cam_device)
+        PyIMAQ.imgConfigTrigBufferWithTTL1(timeout=1000)
+        PyIMAQ.imgSetAttributeROI(0, 0, self.oct.alines_per_buffer, self.oct.aline_size)
+        PyIMAQ.imgInitBuffer(self.niconfig.number_of_imaq_buffers)
+        print("NIOCTController: initialized IMAQ interface...")
+
+    def _close_hardware_interface(self):
         PyIMAQ.imgStopAcq()
         PyIMAQ.imgClose()
-        self._scan_task.stop()
-        self._scan_task.close()
+        try:
+            self._scan_task.stop()
+            self._scan_task.close()
+            print("Hardware interface closed.")
+        except AttributeError:
+            pass
+
+
+class OCTAControlProcess(NIOCTControlProcess):
+    def __init__(self, exit_event, frame_buffer_max=32, poll_time_sec=float(1 / 2)):
+
+        super(NIOCTControlProcess, self).__init__(exit_event, frame_buffer_max, poll_time_sec)
+
+        # Shared buffer
+        self.frame_buffer = None  # SharedCircularBuffer
+
+        # Properties
+        self.writer = WriterConfig()
+        self.halfwidth = None  # Width of the spatial A-line
+        self._time_started = None
+        self._grabbed = 0
+        self._tmp_buffer = None  # Buffer for frame prior to cropping and reshaping
+        self.frame_buffer_mode = False  # If True, multiple buffers are used to acquire frame
+
+        self._writer_exit = None
+        self._writer_process = None  # Process which saves each grab to disk if the saving flag is True.
+
+    def setup(self):
+        self._writer_exit = mp.Event()
+        self._writer_process = NpyWriterProcess(self._writer_exit)
+        self._writer_process.start()
+
+    def close(self):
+        self._close_hardware_interface()
+        self._writer_exit.set()
+        self._writer_process.join(timeout=0)
+        if self._writer_process.is_alive():  # If it's stuck, terminate it
+            self._writer_process.terminate()
+            print(type(self).__name__ + ': writer terminated!')
+        else:
+            print(type(self).__name__ + ': writer closed safely.')
 
     def recv_msg(self, message):
-        if isinstance(message, MotionOCTMessage):
+        if isinstance(message, OCTAMessage):
             if message.instruction is INSTR_OPEN:
-                print("MotionOCTController: recv INSTR_OPEN")
-                # Copy all params from message
-                self.niconfig = message.niconfig
-                self.scansig = message.scansig
-                self.aline_size = message.aline_size
-                self.alines_per_buffer = message.alines_per_buffer
-                self.number_of_blines = message.number_of_blines
-                self.apod_window = message.apod_window
-                self.lambda_data = message.lambda_data
-                self.phase_corr_apod_filter_2d = message.phase_corr_apod_filter_2d.astype(np.float32)
-                self.zstart = message.zstart
-                self.npeak = message.npeak
-                self.nrepeat = message.nrepeat
-                self.time_lags = np.array(message.time_lags).astype(np.int32)
-                # Derived params
-                self.bwidth = int(self.alines_per_buffer / self.number_of_blines)
-                self.halfwidth = int(self.aline_size / 2 + 1)
-                self.time_lags_n = len(self.time_lags)
+                print("OCTAControlProcess: recv INSTR_OPEN")
+                self._copy_params_from_msg(message)
 
-                # Initialize DAQmx interface
-                self._scan_task = nidaqmx.Task()
-                self._scan_timing = nidaqmx.task.Timing(self._scan_task)
-                dac_name = self.niconfig.dac_device
-                dac_ao_channel_ids = [
-                    dac_name + '/' + self.niconfig.line_trig_ch,
-                    dac_name + '/' + self.niconfig.frame_trig_ch,
-                    dac_name + '/' + self.niconfig.x_ch,
-                    dac_name + '/' + self.niconfig.y_ch
-                ]
-                for ch_name in dac_ao_channel_ids:
-                    print("MotionOCTController: adding DAQmx ao channel", ch_name)
-                    self._scan_task.ao_channels.add_ao_voltage_chan(ch_name)
+                if self.oct.alines_per_bline * self.oct.number_of_blines > 0:
+                    self.frame_buffer_mode = True
+                    frame_size = self.oct.aline_size * self.oct.alines_per_bline
+                else:
+                    self.frame_buffer_mode = False
+                    frame_size = self.oct.aline_size * self.oct.alines_per_bline * self.oct.number_of_blines
 
-                self._scan_task.timing.cfg_samp_clk_timing(self.niconfig.dac_rate,  # TODO move?
-                                                           source="",
-                                                           active_edge=Edge.RISING,
-                                                           sample_mode=AcquisitionType.CONTINUOUS)
-                self._scan_writer = AnalogMultiChannelWriter(self._scan_task.out_stream)
-
-                print("MotionOCTController: initialized DAQmx interface...")
-                # Initialize IMAQ interface
-                PyIMAQ.imgOpen(self.niconfig.cam_device)
-                PyIMAQ.imgConfigTrigBufferWithTTL1(timeout=1000)
-                PyIMAQ.imgSetAttributeROI(0, 0, self.alines_per_buffer, self.aline_size)
-                PyIMAQ.imgInitBuffer(self.niconfig.number_of_imaq_buffers)
-                print("MotionOCTController: initialized IMAQ interface...")
-
-                # Initialize FAST OCT interface
-                PyIMAQ.octPlan(apod=self.apod_window)
-                # PyIMAQ.octPlan()
-
-                PyIMAQ.octMotionPlan(self.zstart, self.npeak, self.number_of_blines, repeat=self.nrepeat,
-                                     apod_filter_2d=self.phase_corr_apod_filter_2d)
-                print("MotionOCTController: planned Fast SD-OCT processing...")
-
-                # Change status to ready
-                self.status.value = READY
+                print("OCTAControlProcess: opening hardware interface with buflist trigger mode", self.frame_buffer_mode)
+                self._init_hardware_interface()
+                if PyIMAQ.imgGetFrameSize() == frame_size:
+                    # Initialize FAST OCT interface
+                    if self.oct.apod_window is not None:
+                        if self.oct.lambda_data is not None:
+                            print("OCTAControlProcess: planning Fast SD-OCT processing with interp and apod")
+                            PyIMAQ.octPlan(lam=self.oct.lambda_data, apod=self.oct.apod_window)
+                        else:
+                            print("OCTAControlProcess: planning Fast SD-OCT processing with apod")
+                            PyIMAQ.octPlan(apod=self.oct.apod_window)
+                    else:
+                        print("OCTAControlProcess: planning Fast SD-OCT processing, FFT only")
+                        PyIMAQ.octPlan()
+                    # Change status to ready
+                    self.status.value = STATUS_READY
+                else:
+                    print(
+                        "OCTAControlProcess: failed to open IMAQ interface... the requested buffer size is too large, or the hardware may be in use")
 
             elif message.instruction is INSTR_CLOSE:
-                print("MotionOCTController: recv INSTR_CLOSE")
+                print("OCTAControlProcess: recv INSTR_CLOSE")
+                self.status.value = STATUS_NOT_READY
                 self._exit_event.set()
             elif message.instruction is INSTR_START_ACQ:
-                print("MotionOCTController: recv INSTR_START_ACQ")
-                if self.status.value is READY:
+                print("OCTAControlProcess: recv INSTR_START_ACQ")
+                if self.status.value is STATUS_READY:
                     self._buffer_scan_samples()  # Send new scan signals to the hardware
                     self._time_started = time.time()
+                    self._grabbed = 0
                     PyIMAQ.imgStartAcq()
+                    print("OCTAControlProcess: img start acq")
                     self._scan_task.start()
-                    self.status.value = ACQUIRING
+                    print("OCTAControlProcess: scan task started")
+                    self.status.value = STATUS_ACQUIRING
                 else:
+                    print("OCTAControlProcess: Can't start... not ready")
                     return
             elif message.instruction is INSTR_STOP_ACQ:
-                print("MotionOCTController: recv INSTR_STOP_ACQ")
-                self.status.value = READY
-                PyIMAQ.imgStopAcq()
-                self._scan_task.stop()
+                print("OCTAControlProcess: recv INSTR_STOP_ACQ")
+                if self.status.value is STATUS_ACQUIRING:
+                    PyIMAQ.imgStopAcq()
+                    self._scan_task.stop()
+                    self.status.value = STATUS_READY
             elif message.instruction is INSTR_UPDATE_ACQ:
-                print("MotionOCTController: recv INSTR_UPDATE_ACQ")
-                self._buffer_scan_samples()
+                print("OCTAControlProcess: recv INSTR_UPDATE_ACQ")
+                if self.status.value is STATUS_ACQUIRING:
+                    print("Buffering new scan signals mid-acquisition...")
+                    self.scansig = message.scansig
+                    self.oct.ztop = message.oct.ztop
+                    self.oct.zbottom = message.oct.zbottom
+                    self._buffer_scan_samples()
+                else:
+                    self._copy_params_from_msg(message)
                 # TODO allow for other parameters to be updated during acquisition?
+            elif message.instruction is INSTR_BEGIN_SAVE:
+                print("OCTAControlProcess: recv INSTR_BEGIN_SAVE")
+                self.saving.value = 1
+                self.writer = message.writer
+                print("Writer config", self.writer.fpath, self.writer.max_bytes)
+                self._writer_process.config(self.writer.fpath, self.writer.max_bytes)
+            elif message.instruction is INSTR_END_SAVE:
+                print("OCTAControlProcess: recv INSTR_END_SAVE")
+                self.saving.value = 0
             else:
                 return
         else:
@@ -353,29 +431,65 @@ class MotionOCTControlProcess(HardwareControlProcess):
 
     def acquire_frame(self):
         # Allocate frame memory
-        f = MotionOCTFrame()
-        bflat = np.zeros(self.halfwidth * self.alines_per_buffer, dtype=np.complex64)
-        f.b = np.zeros([self.halfwidth, self.alines_per_buffer], dtype=np.complex64)
-        f.mot = np.zeros([3 * self.number_of_blines], dtype=np.float32)
-        print("MotionOCTController: allocated frame memory...")
-
-        # Poll the fast OCT interface
-        print('calling octMotion', self.time_lags_n, self.time_lags, f.mot)
-        rval = PyIMAQ.octMotion(self.time_lags_n, self.time_lags, f.mot)
-        if rval is 0:
-            print("MotionOCTController: acquired motion successfully...")
-            PyIMAQ.octCopyReferenceFrame(bflat)
-            f.spec = PyIMAQ.octCopySpectrum(1)
-            # Reshape b, ROI
-            for i in range(self.alines_per_buffer):
-                f.b[:, i] = bflat[self.halfwidth * i:self.halfwidth * i + self.halfwidth]
-            f.b = np.roll(f.b, self.alines_per_buffer - 2, axis=1)  # TODO this is a visual bandaid on a problem!
-            f.b = np.abs(f.b)
-            f.b = f.b[self.zstart:self.zstart + self.bwidth, :]
+        f = OCTAFrame()
+        f.rr = np.empty([self.oct.zbottom - self.oct.ztop, self.oct.alines_per_bline, self.oct.number_of_blines],
+                        dtype=np.complex64)
+        f.dc = None  # Allocated by IMAQ wrapper
+        f.spec = None
+        if self.frame_buffer_mode:  # One buffer per B-scan
+            for j in range(self.oct.number_of_blines):
+                rval = PyIMAQ.octCopyBuffer(j, self._tmp_buffer)
+                if rval is not -1:
+                    self._grabbed += 1
+                    # Reshape and crop frame
+                    seek = 0
+                    for i in range(self.oct.alines_per_bline):
+                        np.copyto(f.rr[:, i, j], self._tmp_buffer[
+                                        self.halfwidth * seek:self.halfwidth * seek + self.halfwidth][
+                                        self.oct.ztop:self.oct.zbottom])
+                        seek += 1
+                else:
+                    return None
+            f.dc = PyIMAQ.octCopyDCSpectrum()
+            f.spec = PyIMAQ.octCopySpectrum(0)
+            if self.saving.value == 1:
+                if len(np.shape(f.rr)) is 3:
+                    self._writer_process.enqueue(np.reshape(f.rr, [1, self.oct.zbottom - self.oct.ztop,
+                                                                   self.oct.alines_per_bline,
+                                                                   self.oct.number_of_blines]))
             return f
-        else:
-            print("MotionOCTController: failed to acquire a frame...")
-            return None
+        else:  # One buffer per volume
+            # Poll the fast OCT interface
+            rval = PyIMAQ.octCopyBuffer(self._grabbed, self._tmp_buffer)
+            if rval is not -1:
+                # Reshape and crop frame
+                seek = 0
+                for j in range(self.oct.number_of_blines):
+                    for i in range(self.oct.alines_per_bline):
+                        f.rr[:, i, j] = self._tmp_buffer[self.halfwidth * seek:self.halfwidth * seek + self.halfwidth][
+                                        self.oct.ztop:self.oct.zbottom]
+                        seek += 1
+                f.dc = PyIMAQ.octCopyDCSpectrum()
+                f.spec = PyIMAQ.octCopySpectrum(0)
+                self._grabbed += 1
+                if self.saving.value == 1:
+                    if len(np.shape(f.rr)) is 3:
+                        self._writer_process.enqueue(np.reshape(f.rr, [1, self.oct.zbottom - self.oct.ztop,
+                                                                       self.oct.alines_per_bline,
+                                                                       self.oct.number_of_blines]))
+                return f
+            else:
+                return None
+
+    def _copy_params_from_msg(self, message):
+        self.niconfig = message.niconfig
+        self.scansig = message.scansig
+        self.oct = message.oct
+        self.writer = message.writer
+        self.halfwidth = int(self.oct.aline_size / 2 + 1)
+        self._tmp_buffer = np.empty(self.halfwidth * self.oct.alines_per_bline * self.oct.number_of_blines,
+                                    dtype=np.complex64)
+        print("OCTAControlProcess: all params updated...")
 
     def _buffer_scan_samples(self):
         if isinstance(self.scansig, ScanSignals):
@@ -383,72 +497,46 @@ class MotionOCTControlProcess(HardwareControlProcess):
                                                           self.scansig.frame_trig_sig,
                                                           self.scansig.x_sig,
                                                           self.scansig.y_sig]))
+            print("OCTAControlProcess: buffered scan signals")
         else:
+            print("OCTAControlProcess: failed to buffer scan sigs: invalid format")
             return
 
+    def _init_hardware_interface(self):
+        # Initialize DAQmx interface
 
-# -- Controller objects ------------------------------------------------------------------------------------------------
+        self._scan_task = nidaqmx.Task()
+        self._scan_timing = nidaqmx.task.Timing(self._scan_task)
+        dac_name = self.niconfig.dac_device
+        dac_ao_channel_ids = [
+            dac_name + '/' + self.niconfig.line_trig_ch,
+            dac_name + '/' + self.niconfig.frame_trig_ch,
+            dac_name + '/' + self.niconfig.x_ch,
+            dac_name + '/' + self.niconfig.y_ch
+        ]
+        for ch_name in dac_ao_channel_ids:
+            self._scan_task.ao_channels.add_ao_voltage_chan(ch_name)
 
+        self._scan_task.timing.cfg_samp_clk_timing(self.niconfig.dac_rate,  # TODO move?
+                                                   source="",
+                                                   active_edge=Edge.RISING,
+                                                   sample_mode=AcquisitionType.CONTINUOUS)
+        self._scan_task.regen_mode = nidaqmx.constants.RegenerationMode.DONT_ALLOW_REGENERATION  # TODO test
+        self._scan_writer = AnalogMultiChannelWriter(self._scan_task.out_stream)
 
-class OCTController:
-    """
-    Base class for interfacing GUI with OCT hardware. Interaction with hardware such as frame grabs and galvo signal
-    buffering and generation are carried out by another a Process. This class is responsible for managing the
-    parameters of the current acquisition and for communicating with the Process class.
-    """
-
-    def __init__(self, line_size=2048):
-        self._control_process = None  # type: HardwareControlProcess
-        self._control_process_msg_queue = None  # type: mp.Queue
-        self._scan_pattern = None  # type: LineScanPattern
-        self._line_size = line_size
-
-    # Required public methods
-
-    def initialize(self):
-        """
-        Allocate memory and initialize interfaces and buffers
-        :return: 0 on success
-        """
-        raise NotImplementedError()
-
-    def close(self):
-        """
-        Dispose of interfaces and buffers
-        :return: 0 on success
-        """
-        raise NotImplementedError()
-
-    def start_scan(self):
-        """
-        Begin filling the frame buffer with the current acquisition parameters
-        :return: 0 on success
-        """
-        raise NotImplementedError()
-
-    def stop_scan(self):
-        """
-        Pause the acquisition and empty the frame buffer
-        :return: 0 on success
-        """
-        raise NotImplementedError()
-
-    def update_scan(self):
-        """
-        Change some parameters of the acquisiton. Critically, this is called while the scan is ongoing, and updates
-        to the scan take place immediately. Not all parameters can be changed without restarting the scan. If the scan
-        pattern is to be updated, this method should take the mutable paremeters and calls its generate method.
-        :return: 0 on success
-        """
-
-    def get_frame(self):
-        """
-        Pop (FIFO) a frame from the frame buffer. Only called during a scan
-        :return: 0 on success, -1 if the controller is not currently scanning
-        """
-
-    def set_scanpattern(self, scan_pattern):
-        raise NotImplementedError()
-        """
-        Takes a scan pattern object and configures scanning system with it.
-        """
+        # Initialize IMAQ interface
+        PyIMAQ.imgOpen(self.niconfig.cam_device)
+        if self.frame_buffer_mode:
+            if self.oct.number_of_blines > 512:
+                self.niconfig.number_of_imaq_buffers = 1
+            elif self.oct.number_of_blines > 256:
+                self.niconfig.number_of_imaq_buffers = 1
+            elif self.oct.number_of_blines > 128:
+                self.niconfig.number_of_imaq_buffers = 1
+            PyIMAQ.imgSetAttributeROI(0, 0, self.oct.alines_per_bline, self.oct.aline_size)
+            PyIMAQ.imgConfigTrigBufferListWithTTL1(timeout=1000)
+            PyIMAQ.imgInitBuffer(self.oct.number_of_blines * self.niconfig.number_of_imaq_buffers)
+        else:
+            PyIMAQ.imgSetAttributeROI(0, 0, self.oct.alines_per_buffer, self.oct.aline_size)
+            PyIMAQ.imgConfigTrigBufferWithTTL1(timeout=1000)
+            PyIMAQ.imgInitBuffer(self.niconfig.number_of_imaq_buffers)

@@ -14,10 +14,10 @@
    <item row="1" column="0">
     <widget class="QCheckBox" name="checkRemoveDC">
      <property name="toolTip">
-      <string>Subtract DC value from vizualized spectrum. The DC signal is simply the average dark image on the spectrometer</string>
+      <string>Plot the apodized, DC-subtracted version of the spectrum</string>
      </property>
      <property name="text">
-      <string>Remove DC offset</string>
+      <string>DC-subtracted</string>
      </property>
     </widget>
    </item>

@@ -1,0 +1,9 @@
+[submodule "src/main/python/PyScanPattern"]
+	path = src/main/python/PyScanPattern
+	url = https://github.com/sstucker/PyScanPattern
+[submodule "src/main/python/PyIMAQ"]
+	path = src/main/python/PyIMAQ
+	url = https://github.com/sstucker/PyIMAQ
+[submodule "src/main/python/npy-append-array"]
+	path = src/main/python/npy-append-array
+	url = https://github.com/sstucker/npy-append-array

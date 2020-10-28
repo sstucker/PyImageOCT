@@ -89,6 +89,12 @@
        <property name="suffix">
         <string> px</string>
        </property>
+       <property name="maximum">
+        <number>1024</number>
+       </property>
+       <property name="value">
+        <number>10</number>
+       </property>
       </widget>
      </item>
      <item row="0" column="1">
@@ -110,10 +116,10 @@
         <string> px</string>
        </property>
        <property name="maximum">
-        <number>1024</number>
+        <number>1025</number>
        </property>
        <property name="value">
-        <number>200</number>
+        <number>500</number>
        </property>
       </widget>
      </item>
@@ -156,7 +162,7 @@
         <number>2400</number>
        </property>
        <property name="value">
-        <number>50</number>
+        <number>64</number>
        </property>
       </widget>
      </item>
@@ -191,7 +197,7 @@
         <double>0.001000000000000</double>
        </property>
        <property name="value">
-        <double>0.050000000000000</double>
+        <double>0.069600000000000</double>
        </property>
       </widget>
      </item>
@@ -226,7 +232,7 @@
         <double>0.010000000000000</double>
        </property>
        <property name="value">
-        <double>1.000000000000000</double>
+        <double>1.740000000000000</double>
        </property>
       </widget>
      </item>
@@ -262,7 +268,7 @@
         <number>3600</number>
        </property>
        <property name="value">
-        <number>50</number>
+        <number>1</number>
        </property>
       </widget>
      </item>
@@ -278,6 +284,9 @@
      </item>
      <item row="1" column="0">
       <widget class="QDoubleSpinBox" name="spinROIHeight">
+       <property name="enabled">
+        <bool>false</bool>
+       </property>
        <property name="toolTip">
         <string>The width of the C-scan in physical units</string>
        </property>
@@ -297,7 +306,7 @@
         <double>0.001000000000000</double>
        </property>
        <property name="value">
-        <double>0.050000000000000</double>
+        <double>0.069600000000000</double>
        </property>
       </widget>
      </item>
@@ -313,6 +322,9 @@
      </item>
      <item row="2" column="0">
       <widget class="QDoubleSpinBox" name="spinSlowAxisSpacing">
+       <property name="enabled">
+        <bool>false</bool>
+       </property>
        <property name="toolTip">
         <string>The distance between adjacent B-scans in physical units</string>
        </property>
@@ -332,7 +344,7 @@
         <double>0.010000000000000</double>
        </property>
        <property name="value">
-        <double>1.000000000000000</double>
+        <double>1.740000000000000</double>
        </property>
       </widget>
      </item>
@@ -359,7 +371,7 @@
         <string>Equal aspect scan</string>
        </property>
        <property name="checked">
-        <bool>false</bool>
+        <bool>true</bool>
        </property>
       </widget>
      </item>

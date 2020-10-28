@@ -34,9 +34,12 @@
   <widget class="QWidget" name="centralwidget">
    <layout class="QGridLayout" name="gridLayout">
     <item row="0" column="0">
-     <widget class="QTabWidget" name="tabWidget">
+     <widget class="QTabWidget" name="mainTabWidget">
       <property name="autoFillBackground">
        <bool>false</bool>
+      </property>
+      <property name="tabShape">
+       <enum>QTabWidget::Rounded</enum>
       </property>
       <property name="currentIndex">
        <number>0</number>
@@ -47,19 +50,25 @@
       <property name="documentMode">
        <bool>false</bool>
       </property>
-      <widget class="QWidget" name="tabOCTA">
+      <property name="tabsClosable">
+       <bool>false</bool>
+      </property>
+      <property name="tabBarAutoHide">
+       <bool>false</bool>
+      </property>
+      <widget class="QWidget" name="tabRaster">
        <attribute name="title">
-        <string>OCTA</string>
+        <string>Raster</string>
        </attribute>
       </widget>
-      <widget class="QWidget" name="tabFig8A">
+      <widget class="QWidget" name="tabRose">
        <attribute name="title">
-        <string>Fig8A</string>
+        <string>Rose</string>
        </attribute>
       </widget>
-      <widget class="QWidget" name="tabCircleA">
+      <widget class="QWidget" name="tabCircle">
        <attribute name="title">
-        <string>CircleA</string>
+        <string>Circle</string>
        </attribute>
       </widget>
      </widget>
@@ -80,7 +89,7 @@
      <x>0</x>
      <y>0</y>
      <width>712</width>
-     <height>17</height>
+     <height>21</height>
     </rect>
    </property>
    <widget class="QMenu" name="menuPreferences">
